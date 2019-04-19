@@ -28,14 +28,18 @@ type lbAgent struct {
 	callOpts      []CallOpt
 }
 
+// DetachedResponseWriter implements http.ResponseWriter without allowing
+// writes to the body or writing the headers from a call to Write or
+// WriteHeader, it is only intended to allow writing the status code in and
+// being able to fetch it later from Status()
 type DetachedResponseWriter struct {
-	Headers http.Header
+	headers http.Header
 	status  int
 	acked   chan struct{}
 }
 
 func (w *DetachedResponseWriter) Header() http.Header {
-	return w.Headers
+	return w.headers
 }
 
 func (w *DetachedResponseWriter) Write(data []byte) (int, error) {
@@ -51,9 +55,9 @@ func (w *DetachedResponseWriter) Status() int {
 	return w.status
 }
 
-func NewDetachedResponseWriter(h http.Header, statusCode int) *DetachedResponseWriter {
+func NewDetachedResponseWriter(statusCode int) *DetachedResponseWriter {
 	return &DetachedResponseWriter{
-		Headers: h,
+		headers: make(http.Header),
 		status:  statusCode,
 		acked:   make(chan struct{}, 1),
 	}
@@ -285,11 +289,15 @@ func (a *lbAgent) setRequestBody(ctx context.Context, call *call) (*bytes.Buffer
 			return
 		}
 
-		r.Body = ioutil.NopCloser(bytes.NewReader(buf.Bytes()))
+		// wrap the buffered bytes in a buffer, so that we can use the Next() method
+		// to avoid having to copy this into another buffer later, see runner_client for
+		// details. since we're handing this over as an io.Reader only, initializing
+		// multiple buffers with the same underlying byte slice is safe here.
+		r.Body = ioutil.NopCloser(bytes.NewBuffer(buf.Bytes()))
 
 		// GetBody does not mutate the state of the request body
 		r.GetBody = func() (io.ReadCloser, error) {
-			return ioutil.NopCloser(bytes.NewReader(buf.Bytes())), nil
+			return ioutil.NopCloser(bytes.NewBuffer(buf.Bytes())), nil
 		}
 
 		close(errApp)

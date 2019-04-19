@@ -1,6 +1,7 @@
 package agent
 
 import (
+	"bytes"
 	"context"
 	"crypto/tls"
 	"encoding/hex"
@@ -161,6 +162,76 @@ func (r *gRPCRunner) Status(ctx context.Context) (*pool.RunnerStatus, error) {
 
 // implements Runner
 func (r *gRPCRunner) TryExec(ctx context.Context, call pool.RunnerCall) (bool, error) {
+
+	// we need to get a response writer that is safe for us to use. the only reason we need this,
+	// ostensibly, is because io operations can't be timed out so we need to do receiveFromRunner
+	// in a goroutine, and we may return from here from a timeout while recv is running, leading
+	// to a race when a placer calls TryExec with the same ResponseWriter we have here. blech.
+	respBuffer := bufPool.Get().(*bytes.Buffer)
+	respBuffer.Reset()
+	defer func() {
+		if ctx.Err() == nil { // this is only safe if we don't time out (receiveFromRunner returned/not called)
+			bufPool.Put(respBuffer)
+		}
+	}()
+
+	writer := syncResponseWriter{
+		headers: make(http.Header),
+		Buffer:  respBuffer,
+	}
+
+	safeCall := callWithResponseWriter(call, &writer)
+	placed, err := r.tryExec(ctx, safeCall)
+	if err != nil || !placed {
+		return placed, err
+	}
+
+	// now we can write to the actual response writer from this thread (so long
+	// as the caller waits, we're playing jenga ofc)
+	rw := call.ResponseWriter()
+	copyHeaders(rw.Header(), writer.Header())
+	rw.WriteHeader(writer.status)
+	io.Copy(rw, writer) // TODO(reed): this is also a buffer->buffer operation :( but it means no errors
+	return true, nil
+}
+
+func callWithResponseWriter(call pool.RunnerCall, rw http.ResponseWriter) pool.RunnerCall {
+	return &wrapCall{call, rw}
+}
+
+// wrapCall implements pool.RunnerCall but bypasses the embedded RunnerCall's ResponseWriter() method
+// TODO this is the worst thing we've tried, except for all the other things we've tried.
+type wrapCall struct {
+	pool.RunnerCall
+	rw http.ResponseWriter
+}
+
+func (c *wrapCall) ResponseWriter() http.ResponseWriter {
+	return c.rw
+}
+
+func copyHeaders(dst, src http.Header) {
+	for k, vs := range src {
+		for _, v := range vs {
+			dst.Add(k, v)
+		}
+	}
+}
+
+// TODO(reed): this is copied. and not only does it make sense in both places for different
+// reasons, it makes sense in another place too. need to reconsider ifaces
+type syncResponseWriter struct {
+	headers http.Header
+	status  int
+	*bytes.Buffer
+}
+
+var _ http.ResponseWriter = new(syncResponseWriter) // nice compiler errors
+
+func (s *syncResponseWriter) Header() http.Header  { return s.headers }
+func (s *syncResponseWriter) WriteHeader(code int) { s.status = code }
+
+func (r *gRPCRunner) tryExec(ctx context.Context, call pool.RunnerCall) (bool, error) {
 	log := common.Logger(ctx).WithField("runner_addr", r.address)
 
 	log.Debug("Attempting to place call")
@@ -231,8 +302,28 @@ func (r *gRPCRunner) TryExec(ctx context.Context, call pool.RunnerCall) (bool, e
 }
 
 func sendToRunner(ctx context.Context, protocolClient pb.RunnerProtocol_EngageClient, runnerAddress string, call pool.RunnerCall) {
-	bodyReader := call.RequestBody()
-	writeBuffer := make([]byte, MaxDataChunk)
+	bodyReader := call.RequestBody() // RequestBody returns the whole body w/ new io.Reader each call (safe)
+
+	// TODO(reed): consider not using closure
+	var next func() ([]byte, error)
+
+	if nexter, ok := bodyReader.(interface{ Next(n int) []byte }); ok {
+		// if we have a buffer already (pretty sure this is the case), save us the copying...
+		next = func() ([]byte, error) {
+			return nexter.Next(MaxDataChunk), nil
+		}
+
+	} else {
+		writeBuffer := bufPool.Get().(*bytes.Buffer)
+		defer bufPool.Put(writeBuffer)
+
+		next = func() ([]byte, error) {
+			writeBuffer.Reset()
+			// WARNING: blocking read.
+			_, err := io.CopyN(writeBuffer, bodyReader, MaxDataChunk)
+			return writeBuffer.Bytes(), err
+		}
+	}
 
 	log := common.Logger(ctx).WithField("runner_addr", runnerAddress)
 	// IMPORTANT: IO Read below can fail in multiple go-routine cases (in retry
@@ -244,15 +335,14 @@ func sendToRunner(ctx context.Context, protocolClient pb.RunnerProtocol_EngageCl
 	// the 'Read' below is an actually non-blocking operation since GetBody() should hand out
 	// a new instance of io.ReadCloser() that allows repetitive reads on the http body.
 	for {
-		// WARNING: blocking read.
-		n, err := bodyReader.Read(writeBuffer)
+		data, err := next()
 		if err != nil && err != io.EOF {
 			log.WithError(err).Error("Failed to receive data from http client body")
 		}
+		n := len(data)
 
 		// any IO error or n == 0 is an EOF for pure-runner
 		isEOF := err != nil || n == 0
-		data := writeBuffer[:n]
 
 		log.Debugf("Sending %d bytes of data isEOF=%v to runner", n, isEOF)
 		sendErr := protocolClient.Send(&pb.ClientMsg{
@@ -342,6 +432,7 @@ func recordFinishStats(ctx context.Context, msg *pb.CallFinished, c pool.RunnerC
 		statsLBAgentRunnerSchedLatency(ctx, runnerSchedLatency)
 		statsLBAgentRunnerExecLatency(ctx, runnerExecLatency)
 
+		// TODO: this is not safe to be called from within receiveFromRunner, it may get called each retry (data race, but also incorrect)
 		c.AddUserExecutionTime(runnerExecLatency)
 	}
 }
